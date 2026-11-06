@@ -25,8 +25,7 @@ def parse_profile_log(file_path: Path, log_callback=None):
     bmc_ip = ip_raw.replace('-', '.')
     log(f"📄 开始解析PROFILE文件: {file_path.name}, BMC IP={bmc_ip}")
 
-    # ---------- 1. 提取 DIMM Info 映射 (Skt, Ch) -> (SN, DIMM Physical) ----------
-    # ---------- 1. 提取 DIMM Info 映射 (Skt, Ch) -> (SN, DIMM Physical) ----------
+    # ---------- 1. 提取 DIMM Info 映射 ----------
     dimm_map = {}
     dimm_match = re.search(r'\[Display Dimm Info\] Start(.*?)\[Display Dimm Info\]\.\.\.End', content, re.DOTALL)
     if dimm_match:
@@ -34,40 +33,44 @@ def parse_profile_log(file_path: Path, log_callback=None):
         socket_blocks = re.split(r'\| Socket \d+ \|', dimm_text)
         for socket_idx, block in enumerate(socket_blocks[1:], start=0):
             lines_block = [line.strip() for line in block.splitlines() if line.strip().startswith('|')]
-            if not lines_block:
+            
+            # 找 Physical 行
+            physical_line = None
+            for line in reversed(lines_block):
+                if 'Physical' in line:
+                    physical_line = line
+                    break
+                    
+            if not physical_line:
                 continue
+                
             sn_values = [None] * 8
             physical_values = [None] * 8
+            
+            # 找 SN 行
+            sn_line = None
             for line in lines_block:
-                parts = [p.strip() for p in line.split('|')]
-                parts = parts[1:-1]   # 去掉首尾空
-                if len(parts) <9:
+                parts = [p.strip() for p in line.split('|')][1:-1]
+                if len(parts) < 2:
                     continue
-
-                # 处理SN行：单元格内是16位hex SN (ff开头)
-                has_sn_line = False
-                for cell in parts:
-                    if re.match(r'^[0-9a-fA-F]{16}$', cell) or cell.startswith("ff"):
-                        has_sn_line = True
-                        break
-                if has_sn_line:
-                    # parts[1] ~ parts[8] 对应 ch0~ch7
+                if any(re.match(r'^[0-9a-fA-F]{16,24}$', cell) for cell in parts[1:9]):
+                    sn_line = line
+                    break
+            
+            if sn_line:
+                sn_parts = [p.strip() for p in sn_line.split('|')][1:-1]
+                if len(sn_parts) >= 8:
                     for ch in range(8):
-                        cell_val = parts[1+ch].strip()
-                        if re.match(r'^[0-9a-fA-F]{16}$', cell_val) or cell_val.startswith("ff"):
-                            sn_values[ch] = cell_val
-                    continue
+                        sn_values[ch] = sn_parts[1+ch].strip()
+                        
+            phys_parts = [p.strip() for p in physical_line.split('|')][1:-1]
+            if len(phys_parts) >= 8:
+                for ch in range(8):
+                    cell_val = phys_parts[1+ch].strip()
+                    m = re.search(r'DIMM\s*(\d{3})', cell_val)
+                    if m:
+                        physical_values[ch] = f"DIMM{m.group(1)}"
 
-                # 处理Physical行
-                if "Physical" in line:
-                    for ch in range(8):
-                        cell_val = parts[1+ch].strip()
-                        m = re.search(r'DIMM\s*(\d{3})', cell_val)
-                        if m:
-                            physical_values[ch] = f"DIMM{m.group(1)}"
-                    continue
-
-            # 组装map：socket_idx + ch → (sn, physical)
             for ch in range(8):
                 sn = sn_values[ch]
                 phy = physical_values[ch]
@@ -120,10 +123,6 @@ def parse_profile_log(file_path: Path, log_callback=None):
             break
         result_lines.append(nxt)
 
-    if not result_lines:
-        log("⚠️ 未找到 Result 数据")
-        return pd.DataFrame(columns=PROFILE_COLUMNS)
-
     result_data = {}
     for line in result_lines:
         parts = line.split()
@@ -138,19 +137,17 @@ def parse_profile_log(file_path: Path, log_callback=None):
         except ValueError:
             continue
 
-    # ---------- 4. 生成 Origin 和 Result 行（加入 SN 和 DIMM Physical） ----------
+    # ---------- 4. 生成 Origin 和 Result 行 ----------
     param_names = ['Vdd', 'Vddq', 'Vpp', 'tWR', 'tRCD', 'tRP', 'tRAS', 'tRFC', 'tDelay']
     rows = []
 
     for (skt, ch), origin_vals in origin_data.items():
         if (skt, ch) not in result_data:
-            log(f"⚠️ Skt={skt}, Ch={ch} 在 Result 中不存在，跳过")
             continue
 
         result_vals = result_data[(skt, ch)]
         sn, physical = dimm_map.get((skt, ch), (None, None))
 
-        # Origin 行
         row_origin = {
             'BMC IP': bmc_ip,
             'Type': 'Origin',
@@ -163,7 +160,6 @@ def parse_profile_log(file_path: Path, log_callback=None):
             row_origin[name] = origin_vals[i]
         rows.append(row_origin)
 
-        # Result 行
         row_result = {
             'BMC IP': bmc_ip,
             'Type': 'Result',
@@ -176,11 +172,7 @@ def parse_profile_log(file_path: Path, log_callback=None):
             row_result[name] = result_vals[i]
         rows.append(row_result)
 
-        log(f"✅ Skt={skt}, Ch={ch}: SN={sn}, DIMM={physical}, Origin={origin_vals}, Result={result_vals}")
-
     if not rows:
-        log("⚠️ 没有生成任何数据")
         return pd.DataFrame(columns=PROFILE_COLUMNS)
 
-    df = pd.DataFrame(rows, columns=PROFILE_COLUMNS)
-    return df
+    return pd.DataFrame(rows, columns=PROFILE_COLUMNS)
